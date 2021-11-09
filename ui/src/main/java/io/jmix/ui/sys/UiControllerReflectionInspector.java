@@ -30,8 +30,14 @@ import io.jmix.ui.screen.Screen;
 import io.jmix.ui.screen.ScreenFragment;
 import io.jmix.ui.screen.Subscribe;
 import org.apache.commons.lang3.ClassUtils;
+import org.apache.commons.lang3.JavaVersion;
+import org.apache.commons.lang3.SystemUtils;
 import org.apache.commons.lang3.reflect.TypeUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cglib.core.CodeGenerationException;
+import org.springframework.cglib.core.ReflectUtils;
 import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -40,11 +46,11 @@ import org.springframework.util.ReflectionUtils;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.annotation.Resource;
-
 import javax.inject.Inject;
 import javax.inject.Named;
 import java.lang.invoke.*;
 import java.lang.reflect.*;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
@@ -55,6 +61,8 @@ import static org.springframework.core.annotation.AnnotatedElementUtils.findMerg
 
 @Component("ui_UiControllerReflectionInspector")
 public class UiControllerReflectionInspector {
+
+    private static final Logger log = LoggerFactory.getLogger(UiControllerReflectionInspector.class);
 
     protected final LoadingCache<Class<?>, ScreenIntrospectionData> screenIntrospectionCache =
             CacheBuilder.newBuilder()
@@ -83,6 +91,16 @@ public class UiControllerReflectionInspector {
                     .build();
 
     protected final Function<Class, MethodHandles.Lookup> lambdaLookupProvider;
+
+    private static byte[] gimmeLookupClassDef() {
+        return ("\u00CA\u00FE\u00BA\u00BE\0\0\0001\0\21\1\0\13GimmeLookup\7\0\1\1\0\20"
+                + "java/lang/Object\7\0\3\1\0\10<clinit>\1\0\3()V\1\0\4Code\1\0\6lookup\1\0'Ljav"
+                + "a/lang/invoke/MethodHandles$Lookup;\14\0\10\0\11\11\0\2\0\12\1\0)()Ljava/lang"
+                + "/invoke/MethodHandles$Lookup;\1\0\36java/lang/invoke/MethodHandles\7\0\15\14\0"
+                + "\10\0\14\12\0\16\0\17\26\1\0\2\0\4\0\0\0\1\20\31\0\10\0\11\0\0\0\1\20\11\0\5\0"
+                + "\6\0\1\0\7\0\0\0\23\0\3\0\3\0\0\0\7\u00B8\0\20\u00B3\0\13\u00B1\0\0\0\0\0\0")
+                .getBytes(StandardCharsets.ISO_8859_1);
+    }
 
     public UiControllerReflectionInspector() {
         MethodHandles.Lookup original = MethodHandles.lookup();
@@ -118,7 +136,7 @@ public class UiControllerReflectionInspector {
             // Java 10+
             this.lambdaLookupProvider = clazz -> {
                 try {
-                    return (MethodHandles.Lookup) privateLookupInMhFinal.invokeExact(clazz, original);
+                    return (MethodHandles.Lookup) privateLookupInMhFinal.invokeExact(clazz, getLookup(clazz, original));
                 } catch (Error e) {
                     throw e;
                 } catch (Throwable t) {
@@ -191,7 +209,7 @@ public class UiControllerReflectionInspector {
                     site = LambdaMetafactory.metafactory(
                             caller, "accept", consumerType, type.changeParameterType(0, Object.class), methodHandle, type);
                 } catch (LambdaConversionException e) {
-                    throw new RuntimeException("Unable to build lambda consumer " + methodHandle ,e);
+                    throw new RuntimeException("Unable to build lambda consumer " + methodHandle, e);
                 }
 
                 return site.getTarget();
@@ -211,6 +229,29 @@ public class UiControllerReflectionInspector {
         targetIntrospectionCache.invalidateAll();
 
         lambdaMethodsCache.invalidateAll();
+    }
+
+    private MethodHandles.Lookup getLookup(Class callerClass, MethodHandles.Lookup alternative) throws ClassNotFoundException, IllegalAccessException, NoSuchFieldException {
+        //spring devtools RestartClassLoader needs GimmeLookup to have access to not opened modules and private methods
+        //At the same time GimmeLookup without spring devtools causes exception on application start if Java version higher than 11.
+        if (SystemUtils.isJavaVersionAtMost(JavaVersion.JAVA_11)
+                || callerClass.getClassLoader().getClass().getName().endsWith("RestartClassLoader")) {
+
+            Class gimmeLookup;
+            //This code needed to classloader of clazz and classloader of lambda function be same
+            try {
+                gimmeLookup = ReflectUtils.defineClass("GimmeLookup", gimmeLookupClassDef(), callerClass.getClassLoader());
+            } catch (Exception e) {
+                if (!(e instanceof CodeGenerationException)) {//to avoid original exception swallowing
+                    log.warn("Cannot define GimmeLookup",e);
+                }
+                gimmeLookup = callerClass.getClassLoader().loadClass("GimmeLookup");
+            }
+
+            return (MethodHandles.Lookup) gimmeLookup.getField("lookup").get(null);
+        } else {
+            return alternative;
+        }
     }
 
     protected ScreenIntrospectionData getScreenIntrospectionDataNotCached(Class<?> concreteClass) {
